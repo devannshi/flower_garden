@@ -128,6 +128,9 @@ class GreedyGardener(Gardener):
         self._transplant_first_group_to_origin()
         self._cache_first_group_positions()
         self._replicate_first_group()
+        
+        # Build new groups and continue with greedy placement
+        self._fill_remaining_space()
 
         if self.config['debug']['verbose']:
             print('\n=== Placement Complete ===')
@@ -562,7 +565,9 @@ class GreedyGardener(Gardener):
                         continue
 
                 # HARD REQUIREMENT: 3rd plant onwards MUST interact with 2+ different species
-                if len(self.garden.plants) >= 2 and not self._would_interact_with_two_species(variety, position):
+                if len(self.garden.plants) >= 2 and not self._would_interact_with_two_species(
+                    variety, position
+                ):
                     penalized_count += 1
                     continue
 
@@ -821,3 +826,316 @@ class GreedyGardener(Gardener):
             )
             if self.config['debug']['verbose']:
                 print(f'Replicated first group {clones_placed} times')
+    
+    def _fill_remaining_space(self) -> None:
+        """
+        Try to build new independent groups, then continue with greedy one-by-one placement.
+        New groups are built with internal 2-species interaction only.
+        After new groups, remaining plants use greedy placement with global 2-species interaction.
+        """
+        round_num = 1
+        
+        # Try to build new groups
+        while self.remaining_varieties and len(self.remaining_varieties) >= 3:
+            if self.config['debug']['verbose']:
+                print(f'\n=== Round {round_num}: Building New Group ===')
+                print(f'{len(self.remaining_varieties)} varieties remaining')
+            
+            # Try to build a new group
+            initial_plant_count = len(self.garden.plants)
+            new_group_built = self._build_new_independent_group()
+            
+            if not new_group_built:
+                if self.config['debug']['verbose']:
+                    print('Could not build new group. Switching to greedy placement.')
+                break
+            
+            new_group_size = len(self.garden.plants) - initial_plant_count
+            if self.config['debug']['verbose']:
+                print(f'New group successfully built: {new_group_size} plants')
+            
+            round_num += 1
+        
+        # Continue with greedy one-by-one placement for remaining varieties
+        if self.remaining_varieties:
+            if self.config['debug']['verbose']:
+                print(f'\n=== Continuing Greedy Placement ===')
+                print(f'{len(self.remaining_varieties)} varieties remaining')
+            
+            iteration = 0
+            while self.remaining_varieties:
+                iteration += 1
+                
+                # Generate candidate positions
+                candidates = self._generate_candidates()
+                
+                if not candidates:
+                    if self.config['debug']['verbose']:
+                        print('No valid candidates found. Stopping.')
+                    break
+                
+                # Find best (variety, position) pair (now considers entire garden)
+                best_value, best_variety, best_position = self._find_best_placement(candidates)
+                
+                # Check if no valid placement found
+                if best_variety is None or best_position is None:
+                    if self.config['debug']['verbose']:
+                        print('No valid placement found. Stopping.')
+                    break
+                
+                # Check stopping criterion
+                epsilon = self.config['placement']['epsilon']
+                if best_value <= epsilon:
+                    if self.config['debug']['verbose']:
+                        print(f'Best value {best_value:.4f} <= epsilon {epsilon}. Stopping.')
+                    break
+                
+                # Place the plant
+                plant = self.garden.add_plant(best_variety, best_position)
+                
+                if plant is None:
+                    self._consume_variety(best_variety)
+                    continue
+                
+                self._consume_variety(best_variety)
+                
+                # Update score
+                self.current_score = simulate_and_score(
+                    self.garden,
+                    self.config['simulation']['T'],
+                    self.config['simulation']['w_short'],
+                    self.config['simulation']['w_long'],
+                )
+                
+                if self.config['debug']['verbose']:
+                    print(f'  → {best_variety.species.name[0]} at ({int(best_position.x)},{int(best_position.y)}): value={best_value:.2f}, score={self.current_score:.2f}')
+        
+        if self.config['debug']['verbose'] and self.remaining_varieties:
+            print(f'\n{len(self.remaining_varieties)} varieties left')
+    
+    def _build_new_independent_group(self) -> bool:
+        """
+        Try to build a new group of at least 3 plants with internal 2-species interaction.
+        Returns True if successful, False otherwise.
+        """
+        new_group_start_idx = len(self.garden.plants)
+        new_group_plants = []
+        
+        # Try to place at least 3 plants for this new group
+        for plant_num in range(1, 100):  # Max 100 attempts
+            new_group_size = len(self.garden.plants) - new_group_start_idx
+            
+            if new_group_size >= 3:
+                # Successfully built a group of 3+
+                return True
+            
+            # Generate candidates for this plant of the new group
+            if new_group_size == 0:
+                # First plant: find first available position
+                candidates = self._find_first_positions_for_new_group()
+            else:
+                # 2nd+ plant: generate around new group
+                candidates = self._generate_candidates_for_new_group(new_group_start_idx)
+            
+            if not candidates:
+                break
+            
+            # Find best placement considering only new group interactions
+            best_value, best_variety, best_position = self._find_best_placement_for_new_group(
+                candidates, new_group_start_idx
+            )
+            
+            if best_variety is None or best_position is None:
+                break
+            
+            # Place the plant
+            plant = self.garden.add_plant(best_variety, best_position)
+            
+            if plant is None:
+                self._consume_variety(best_variety)
+                continue
+            
+            new_group_plants.append(plant)
+            self._consume_variety(best_variety)
+            
+            if self.config['debug']['verbose']:
+                species_letter = best_variety.species.name[0]
+                print(f'  → {species_letter} at ({int(best_position.x)},{int(best_position.y)})')
+        
+        # Check if we built a valid group
+        final_size = len(self.garden.plants) - new_group_start_idx
+        if final_size < 3:
+            # Remove incomplete group
+            for i in range(len(self.garden.plants) - 1, new_group_start_idx - 1, -1):
+                plant = self.garden.plants[i]
+                self.garden.plants.remove(plant)
+                self.garden._used_varieties.discard(id(plant.variety))
+                # Return variety to available pool
+                if plant.variety not in self.remaining_varieties:
+                    self.remaining_varieties.append(plant.variety)
+                    sig = self._variety_signature(plant.variety)
+                    if sig in self.available_varieties_by_sig:
+                        self.available_varieties_by_sig[sig].append(plant.variety)
+            return False
+        
+        return True
+    
+    def _find_first_positions_for_new_group(self) -> list[Position]:
+        """Find first available position(s) for new group's first plant."""
+        if not self.remaining_varieties:
+            return []
+        
+        prioritized = self._prioritize_varieties()
+        if not prioritized:
+            return []
+        
+        first_variety = prioritized[0]
+        
+        # Scan from left to right, top to bottom
+        for x in range(int(self.garden.width) + 1):
+            for y in range(int(self.garden.height) + 1):
+                position = Position(x=x, y=y)
+                if self.garden.can_place_plant(first_variety, position):
+                    return [position]
+        
+        return []
+    
+    def _generate_candidates_for_new_group(self, new_group_start_idx: int) -> list[Position]:
+        """Generate candidates around plants in the new group only."""
+        new_group_plants = self.garden.plants[new_group_start_idx:]
+        
+        if not new_group_plants:
+            return []
+        
+        # For 2nd plant, prioritize horizontal right
+        if len(new_group_plants) == 1:
+            first_plant = new_group_plants[0]
+            prioritized = self._prioritize_varieties()
+            if not prioritized:
+                return []
+            
+            representative_variety = prioritized[0]
+            candidates = []
+            r_first = first_plant.variety.radius
+            r_new = representative_variety.radius
+            min_distance = max(r_first, r_new)
+            interaction_distance = r_first + r_new
+            
+            for offset in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+                distance = min_distance + offset
+                if distance < interaction_distance:
+                    x = first_plant.position.x + distance
+                    y = first_plant.position.y
+                    candidates.append(Position(x=int(round(x)), y=int(round(y))))
+            
+            for offset in [0.2, 0.4, 0.6]:
+                distance = min_distance + offset
+                if distance < interaction_distance:
+                    for y_offset in [-0.5, 0.5]:
+                        x = first_plant.position.x + distance
+                        y = first_plant.position.y + y_offset
+                        candidates.append(Position(x=int(round(x)), y=int(round(y))))
+            
+            return filter_candidates(candidates, self.garden, tolerance=0.1)
+        
+        # For 3rd+ plant, use geometric candidates
+        prioritized = self._prioritize_varieties()
+        if not prioritized:
+            return []
+        
+        representative_variety = prioritized[0]
+        
+        # Generate multi-species candidates within new group
+        candidates = []
+        for variety in prioritized[:3]:  # Try top 3 species
+            for i, p1 in enumerate(new_group_plants):
+                if p1.variety.species == variety.species:
+                    continue
+                for p2 in new_group_plants[i+1:]:
+                    if p2.variety.species == variety.species or p2.variety.species == p1.variety.species:
+                        continue
+                    
+                    # Generate intersection points
+                    points = circle_circle_intersection(
+                        p1.position, p1.variety.radius + variety.radius,
+                        p2.position, p2.variety.radius + variety.radius
+                    )
+                    candidates.extend(points)
+        
+        # Also add tangency sampling around new group plants
+        import math
+        for plant in new_group_plants:
+            for angle_idx in range(self.config['geometry']['angle_samples']):
+                angle = 2 * math.pi * angle_idx / self.config['geometry']['angle_samples']
+                distance = plant.variety.radius + representative_variety.radius
+                x = plant.position.x + distance * math.cos(angle)
+                y = plant.position.y + distance * math.sin(angle)
+                candidates.append(Position(x=int(round(x)), y=int(round(y))))
+        
+        return filter_candidates(candidates, self.garden, tolerance=0.1)
+    
+    def _find_best_placement_for_new_group(self, candidates: list[Position], new_group_start_idx: int) -> tuple:
+        """Find best placement considering only new group interactions."""
+        best_value = float('-inf')
+        best_variety = None
+        best_position = None
+        
+        new_group_size = len(self.garden.plants) - new_group_start_idx
+        prioritized_varieties = self._prioritize_varieties()
+        
+        # For first 3 plants, force selection of prioritized variety
+        if new_group_size < 3:
+            varieties_to_evaluate = [prioritized_varieties[0]] if prioritized_varieties else []
+        else:
+            varieties_to_evaluate = prioritized_varieties
+        
+        for position in candidates:
+            for variety in varieties_to_evaluate:
+                if not self.garden.can_place_plant(variety, position):
+                    continue
+                
+                # Check species constraint for first 3 plants
+                if new_group_size < 3:
+                    existing_species_in_new_group = {
+                        self.garden.plants[i].variety.species 
+                        for i in range(new_group_start_idx, len(self.garden.plants))
+                    }
+                    if variety.species in existing_species_in_new_group:
+                        continue
+                
+                # Check 2-species interaction within new group (for 3rd+ plant)
+                if new_group_size >= 2:
+                    interacting_species = set()
+                    for i in range(new_group_start_idx, len(self.garden.plants)):
+                        plant = self.garden.plants[i]
+                        if plant.variety.species == variety.species:
+                            continue
+                        distance = calculate_distance(position, plant.position)
+                        if distance < plant.variety.radius + variety.radius:
+                            interacting_species.add(plant.variety.species)
+                    
+                    if len(interacting_species) < 2:
+                        # Try fallback: at least 1 species
+                        if new_group_size == 2 and len(interacting_species) >= 1:
+                            pass  # Allow 1 species for 3rd plant as fallback
+                        else:
+                            continue
+                
+                # Evaluate placement
+                value, delta, reward = evaluate_placement(
+                    self.garden,
+                    variety,
+                    position,
+                    self.config['simulation']['T'],
+                    self.config['placement']['beta'],
+                    self.config['simulation']['w_short'],
+                    self.config['simulation']['w_long'],
+                    self.current_score,
+                )
+                
+                if value > best_value:
+                    best_value = value
+                    best_variety = variety
+                    best_position = position
+        
+        return best_value, best_variety, best_position
