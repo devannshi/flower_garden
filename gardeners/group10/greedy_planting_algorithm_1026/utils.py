@@ -63,6 +63,14 @@ def simulate_and_score(
     return total_growth / len(test_garden.plants)
 
 
+def simulate_total_growth(garden: Garden, turns: int) -> float:
+    """Run a simulation and return the total growth after ``turns``."""
+    garden_copy = copy_garden(garden)
+    engine = Engine(garden_copy)
+    engine.run_simulation(turns)
+    return sum(plant.size for plant in garden_copy.plants)
+
+
 def copy_garden(garden: Garden) -> Garden:
     """
     Create a deep copy of the garden with all plants.
@@ -354,6 +362,7 @@ def evaluate_placement(
     w_short: float,
     w_long: float,
     current_score: float,
+    baseline_growth: float | None = None,
 ) -> tuple[float, float, float]:
     """
     Evaluate placing a variety at a position.
@@ -363,10 +372,10 @@ def evaluate_placement(
         variety: Variety to place
         position: Position to place at
         turns: Simulation turns
-        beta: Plant reward weight
+        beta: Plant reward weight (unused for plants 4+)
         w_short: Short-term weight
         w_long: Long-term weight
-        current_score: Current garden score
+        current_score: Current garden score (unused for plants 4+)
 
     Returns:
         Tuple of (total_value, delta_score, plant_reward)
@@ -378,22 +387,44 @@ def evaluate_placement(
     if test_plant is None:
         return float('-inf'), 0.0, 0.0
 
-    # Calculate new score
-    new_score = simulate_and_score(test_garden, turns, w_short, w_long)
+    # For first 3 plants: use old complex scoring
+    if len(garden.plants) < 3:
+        # Calculate new score
+        new_score = simulate_and_score(test_garden, turns, w_short, w_long)
 
-    # Calculate delta
-    delta = new_score - current_score if len(garden.plants) > 0 else new_score
+        # Calculate delta
+        delta = new_score - current_score if len(garden.plants) > 0 else new_score
 
-    # Calculate plant reward (new plant's contribution)
-    # Note: test_plant in test_garden has been simulated, so it has a size
-    new_plant_growth = 0.0
-    for plant in test_garden.plants:
-        if id(plant.variety) == id(variety):
-            new_plant_growth = plant.size
-            break
+        # Calculate plant reward (new plant's contribution)
+        new_plant_growth = 0.0
+        for plant in test_garden.plants:
+            if id(plant.variety) == id(variety):
+                new_plant_growth = plant.size
+                break
 
-    plant_reward = beta * (new_plant_growth / len(test_garden.plants))
+        plant_reward = beta * (new_plant_growth / len(test_garden.plants))
 
-    total_value = delta + plant_reward
+        total_value = delta + plant_reward
 
-    return total_value, delta, plant_reward
+        return total_value, delta, plant_reward
+    
+    # For plants 4+: use simple growth-based scoring
+    # Score = (overall_growth_new - overall_growth_old) / radius^2
+    
+    # Run simulation to get growth
+    if baseline_growth is None:
+        old_growth = simulate_total_growth(garden, turns)
+    else:
+        old_growth = baseline_growth
+
+    # Simulate new garden
+    new_engine = Engine(test_garden)
+    new_engine.run_simulation(turns)
+    new_growth = sum(plant.size for plant in test_garden.plants)
+    
+    # Calculate score
+    growth_delta = new_growth - old_growth
+    radius_squared = variety.radius ** 2
+    score = growth_delta / radius_squared if radius_squared > 0 else growth_delta
+    
+    return score, growth_delta, 0.0

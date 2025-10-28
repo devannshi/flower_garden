@@ -1,14 +1,7 @@
 """Greedy Planting Algorithm Implementation."""
 
-# Suppress annoying package outputs
 import os
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'  # Suppress pygame welcome message
-import warnings
-warnings.filterwarnings('ignore')  # Suppress warnings
-
-import copy
 from collections import Counter, defaultdict
-from multiprocessing import Pool
 
 import yaml
 
@@ -24,25 +17,9 @@ from gardeners.group10.greedy_planting_algorithm_1026.utils import (
     filter_candidates,
     generate_geometric_candidates,
     geometric_heuristic,
+    simulate_total_growth,
     simulate_and_score,
 )
-
-
-# Global worker function for multiprocessing
-def _evaluate_placement_worker(args):
-    """
-    Worker function for parallel evaluation.
-    Must be defined at module level for pickling.
-    """
-    garden, variety, position, T, beta, w_short, w_long, current_score = args
-    try:
-        value, delta, reward = evaluate_placement(
-            garden, variety, position, T, beta, w_short, w_long, current_score
-        )
-        return (value, delta, reward, variety, position)
-    except Exception as e:
-        # Return negative infinity on error
-        return (float('-inf'), 0, 0, variety, position)
 
 
 class GreedyGardener(Gardener):
@@ -68,9 +45,6 @@ class GreedyGardener(Gardener):
         self.first_group_signatures = []
         self.first_group_positions = []
         self.attempted_new_group_positions = []  # Track failed new group starting positions
-        
-        # Performance optimization: caching
-        self.interaction_cache = {}  # Cache interaction calculations
 
     def _load_config(self) -> dict:
         """Load configuration from YAML file."""
@@ -80,60 +54,12 @@ class GreedyGardener(Gardener):
             config = yaml.safe_load(f)
 
         return config
-    
-    def _get_adaptive_T(self) -> int:
-        """
-        Adaptive simulation depth based on number of placed plants.
-        Early plants are more important, so use longer simulations.
-        Later plants can use shorter simulations for speed.
-        """
-        num_placed = len(self.garden.plants)
-        total_varieties = len(self.original_varieties)
-        
-        if num_placed < total_varieties * 0.2:  # First 20% of plants
-            return self.config['simulation']['T']  # Full T (100)
-        elif num_placed < total_varieties * 0.5:  # Next 30% (20%-50%)
-            return max(50, self.config['simulation']['T'] // 2)  # Half T (50)
-        else:  # Last 50% of plants
-            return max(20, self.config['simulation']['T'] // 5)  # 1/5 T (20)
-    
-    def _cheap_heuristic_score(self, variety, position) -> float:
-        """
-        Fast heuristic scoring without simulation.
-        Used for early pruning before expensive simulation.
-        
-        Considers:
-        - Number of interactions (more is better)
-        - Distance to existing plants (closer is better)
-        - Variety radius (smaller is usually better for fitting more plants)
-        """
-        score = 0.0
-        
-        # Count interactions (most important factor)
-        interacting_species = self._get_interacting_species(variety, position)
-        score += len(interacting_species) * 5.0  # Weight: 5.0 per species interaction
-        
-        # Distance to nearest plant (closer is better for space utilization)
-        if self.garden.plants:
-            min_distance = float('inf')
-            for plant in self.garden.plants:
-                dist = ((position.x - plant.position.x)**2 + (position.y - plant.position.y)**2)**0.5
-                min_distance = min(min_distance, dist)
-            # Normalize distance score (closer = higher score)
-            score += max(0, 10 - min_distance)  # Max bonus of 10 for very close plants
-        
-        # Smaller radius bonus (smaller plants = more can fit)
-        score += max(0, 5 - variety.radius)  # Bonus for smaller plants
-        
-        return score
 
     def cultivate_garden(self) -> None:
         """
         Main placement loop: iteratively place plants using greedy selection.
         """
         iteration = 0
-        first_group_relaxation_used = False
-        first_group_relaxation_plant_idx = None
 
         if self.config['debug']['verbose']:
             print(f'Starting placement with {len(self.remaining_varieties)} varieties')
@@ -152,48 +78,25 @@ class GreedyGardener(Gardener):
                     f'Iter {iteration}: {len(self.garden.plants)} placed, {len(self.remaining_varieties)} remain{constraint_str}'
                 )
 
-            # ALWAYS use exhaustive search for better coverage
-            exhaustive_candidates = self._generate_exhaustive_candidates()
-            if not exhaustive_candidates:
+            # Generate candidate positions
+            candidates = self._generate_candidates()
+
+            if not candidates:
                 if self.config['debug']['verbose']:
                     print('No valid candidates found. Stopping.')
                 break
-                
-            best_value, best_variety, best_position, current_used_relaxation = self._find_best_placement_exhaustive_optimized(exhaustive_candidates)
+
+            if self.config['debug']['log_candidates']:
+                print(f'Generated {len(candidates)} candidates')
+
+            # Find best (variety, position) pair
+            best_value, best_variety, best_position = self._find_best_placement(candidates)
 
             # Check stopping criterion
             epsilon = self.config['placement']['epsilon']
             if best_value <= epsilon:
                 if self.config['debug']['verbose']:
                     print(f'Best value {best_value:.4f} <= epsilon {epsilon}. Stopping.')
-                break
-            
-            # BEFORE placing: Check relaxation conflicts
-            if first_group_relaxation_used and current_used_relaxation:
-                # Both previous and current use relaxation - not allowed!
-                # Rollback: remove previous relaxation plant and stop first group
-                if self.config['debug']['verbose']:
-                    print(f'  [Relaxation failed: consecutive relaxation in first group. Rolling back...]')
-                
-                # Remove previous relaxation plant
-                if first_group_relaxation_plant_idx is not None and first_group_relaxation_plant_idx < len(self.garden.plants):
-                    relaxed_plant = self.garden.plants[first_group_relaxation_plant_idx]
-                    self.garden.plants.remove(relaxed_plant)
-                    self.garden._used_varieties.discard(id(relaxed_plant.variety))
-                    self.remaining_varieties.append(relaxed_plant.variety)
-                    sig = self._variety_signature(relaxed_plant.variety)
-                    if sig in self.available_varieties_by_sig:
-                        self.available_varieties_by_sig[sig].append(relaxed_plant.variety)
-                    # Remove from first_group tracking
-                    if relaxed_plant in self.first_group_plants:
-                        self.first_group_plants.remove(relaxed_plant)
-                    if relaxed_plant.variety in self.first_group_varieties:
-                        self.first_group_varieties.remove(relaxed_plant.variety)
-                    relaxed_sig = self._variety_signature(relaxed_plant.variety)
-                    if relaxed_sig in self.first_group_signatures:
-                        self.first_group_signatures.remove(relaxed_sig)
-                
-                # Stop first group placement
                 break
 
             # Place the plant
@@ -212,19 +115,9 @@ class GreedyGardener(Gardener):
             self.first_group_varieties.append(best_variety)
             self.first_group_signatures.append(self._variety_signature(best_variety))
             self._consume_variety(best_variety)
-            
-            # Track relaxation for first group
-            if current_used_relaxation:
-                first_group_relaxation_used = True
-                first_group_relaxation_plant_idx = len(self.garden.plants) - 1
-                if self.config['debug']['verbose']:
-                    print(f'  [Relaxation used in first group: plant #{len(self.garden.plants)}]')
-            
-            # Use adaptive T for scoring
-            adaptive_T = self._get_adaptive_T()
             self.current_score = simulate_and_score(
                 self.garden,
-                adaptive_T,
+                self.config['simulation']['T'],
                 self.config['simulation']['w_short'],
                 self.config['simulation']['w_long'],
             )
@@ -335,15 +228,14 @@ class GreedyGardener(Gardener):
                     candidates.extend(multi_candidates)
 
             # Always add standard geometric candidates as fallback
-            if self.remaining_varieties:
-                representative_variety = self.remaining_varieties[0]
-                standard_candidates = generate_geometric_candidates(
-                    self.garden,
-                    representative_variety,
-                    self.config['geometry']['angle_samples'],
-                    self.config['geometry']['max_anchor_pairs'],
-                )
-                candidates.extend(standard_candidates)
+            representative_variety = self.remaining_varieties[0]
+            standard_candidates = generate_geometric_candidates(
+                self.garden,
+                representative_variety,
+                self.config['geometry']['angle_samples'],
+                self.config['geometry']['max_anchor_pairs'],
+            )
+            candidates.extend(standard_candidates)
         else:
             # 2nd plant: prioritize horizontal right placement
             # Generate candidates to the right of the first plant
@@ -515,430 +407,6 @@ class GreedyGardener(Gardener):
 
         return boundary_candidates
     
-    def _generate_exhaustive_candidates(self) -> list[Position]:
-        """
-        Generate candidates by scanning the entire garden grid.
-        Used as fallback when standard candidate generation fails.
-        
-        Returns positions that are:
-        - Not inside existing plants (collision-free)
-        - Can potentially interact with at least one existing plant
-        """
-        candidates = []
-        
-        # Grid sample the entire garden at integer positions
-        # Use step size of 1 for comprehensive coverage
-        for x in range(int(self.garden.width) + 1):
-            for y in range(int(self.garden.height) + 1):
-                pos = Position(x=x, y=y)
-                
-                # Check if this position is far enough from all plants (not inside any plant)
-                is_valid = True
-                for plant in self.garden.plants:
-                    dist = ((pos.x - plant.position.x)**2 + (pos.y - plant.position.y)**2)**0.5
-                    # Must be outside the plant's core radius
-                    if dist < plant.variety.radius * 0.9:
-                        is_valid = False
-                        break
-                
-                if is_valid:
-                    candidates.append(pos)
-        
-        if self.config['debug']['verbose'] and candidates:
-            print(f'  Generated {len(candidates)} exhaustive candidates')
-        
-        return candidates
-    
-    def _find_best_placement_exhaustive_optimized(self, candidates: list[Position]) -> tuple:
-        """
-        Optimized exhaustive search that groups candidates by interaction pattern.
-        For candidates with same interaction, only evaluate the one with best space utilization.
-        
-        Returns:
-            Tuple of (best_value, best_variety, best_position, used_relaxation)
-        """
-        best_value = float('-inf')
-        best_variety = None
-        best_position = None
-        used_relaxation = False  # Track if we used 1-species relaxation
-        
-        # Get prioritized varieties
-        prioritized_varieties = self._prioritize_varieties()
-        
-        # Evaluate all unique varieties
-        signature_representatives = {}
-        for variety in prioritized_varieties:
-            sig = self._variety_signature(variety)
-            if sig not in signature_representatives:
-                signature_representatives[sig] = variety
-        varieties_to_evaluate = list(signature_representatives.values())
-        
-        require_two_species = len(self.garden.plants) >= 3
-        garden_is_empty = len(self.garden.plants) == 0
-        
-        # Group candidates by (variety, interaction_pattern)
-        from collections import defaultdict
-        interaction_groups = defaultdict(list)
-        
-        for position in candidates:
-            for variety in varieties_to_evaluate:
-                # Check if can place
-                if not self.garden.can_place_plant(variety, position):
-                    continue
-                
-                # Get interacting species
-                interacting_species = self._get_interacting_species(variety, position)
-                
-                # Check interaction requirements
-                if garden_is_empty:
-                    # First plant: no interaction required
-                    pass
-                elif require_two_species:
-                    if len(interacting_species) < 2:
-                        continue
-                else:
-                    if len(interacting_species) < 1:
-                        continue
-                
-                # Create interaction key: (variety_sig, frozenset of interacting species)
-                variety_sig = self._variety_signature(variety)
-                interaction_key = (variety_sig, frozenset(interacting_species))
-                
-                # Calculate space utilization score (closer to plants = better)
-                if garden_is_empty:
-                    # For first plant, prefer positions closer to (0,0)
-                    space_score = -(position.x**2 + position.y**2)**0.5
-                else:
-                    min_distance = float('inf')
-                    for plant in self.garden.plants:
-                        dist = ((position.x - plant.position.x)**2 + (position.y - plant.position.y)**2)**0.5
-                        min_distance = min(min_distance, dist)
-                    # Negative min_distance because we want closer positions first
-                    space_score = -min_distance
-                
-                # Store: (position, variety, space_score)
-                interaction_groups[interaction_key].append((position, variety, space_score))
-        
-        if self.config['debug']['verbose']:
-            total_combos = sum(len(group) for group in interaction_groups.values())
-            print(f'  Exhaustive eval: {len(candidates)} pos × {len(varieties_to_evaluate)} varieties = {total_combos} combos in {len(interaction_groups)} groups')
-        
-        # STRATEGY C OPTIMIZATION: Early Pruning with Cheap Heuristics
-        # Step 1: Collect representatives from each interaction group
-        representatives = []
-        for interaction_key, group in interaction_groups.items():
-            # Sort by space_score (higher = better = closer to existing plants)
-            group.sort(key=lambda x: x[2], reverse=True)
-            # Take the best one from each group
-            position, variety, space_score = group[0]
-            representatives.append((position, variety, space_score))
-        
-        # Step 2: Apply cheap heuristic scoring
-        candidates_with_heuristic = []
-        for position, variety, space_score in representatives:
-            cheap_score = self._cheap_heuristic_score(variety, position)
-            candidates_with_heuristic.append((cheap_score, position, variety, space_score))
-        
-        # Step 3: Sort by cheap score and take top K candidates
-        candidates_with_heuristic.sort(reverse=True, key=lambda x: x[0])
-        
-        # Use heuristic_top_k if set, otherwise use percentage
-        heuristic_top_k = self.config.get('performance', {}).get('heuristic_top_k', 10)
-        if heuristic_top_k > 0:
-            num_to_evaluate = min(heuristic_top_k, len(candidates_with_heuristic))
-        else:
-            heuristic_top_percent = self.config.get('performance', {}).get('heuristic_top_percent', 0.3)
-            num_to_evaluate = max(10, int(len(candidates_with_heuristic) * heuristic_top_percent))
-        
-        top_candidates = candidates_with_heuristic[:num_to_evaluate]
-        
-        # Step 4: Run expensive simulation on top candidates
-        # Use adaptive T based on number of plants
-        adaptive_T = self._get_adaptive_T()
-        
-        evaluations_run = len(top_candidates)
-        
-        # Decide whether to use parallel or serial evaluation
-        use_parallel = (
-            self.config.get('performance', {}).get('parallel', False) and
-            evaluations_run >= self.config.get('performance', {}).get('parallel_threshold', 8)
-        )
-        
-        # Stage 1: Initial evaluation with adaptive T
-        first_stage_results = []
-        
-        if use_parallel:
-            # Parallel evaluation using multiprocessing
-            try:
-                # Prepare arguments for parallel execution
-                eval_args = [
-                    (
-                        copy.deepcopy(self.garden),  # Deep copy garden for each worker
-                        variety,
-                        position,
-                        adaptive_T,
-                        self.config['placement']['beta'],
-                        self.config['simulation']['w_short'],
-                        self.config['simulation']['w_long'],
-                        self.current_score
-                    )
-                    for cheap_score, position, variety, space_score in top_candidates
-                ]
-                
-                # Run parallel evaluation
-                num_workers = self.config.get('performance', {}).get('num_workers', 4)
-                with Pool(processes=num_workers) as pool:
-                    results = pool.map(_evaluate_placement_worker, eval_args)
-                
-                # Collect all results
-                for value, delta, reward, variety, position in results:
-                    first_stage_results.append((value, variety, position))
-                    if value > best_value:
-                        best_value = value
-                        best_variety = variety
-                        best_position = position
-            
-            except Exception as e:
-                # Fall back to serial if parallel fails
-                if self.config['debug']['verbose']:
-                    print(f'    Parallel evaluation failed, falling back to serial: {e}')
-                use_parallel = False
-        
-        if not use_parallel:
-            # Serial evaluation (original method)
-            for cheap_score, position, variety, space_score in top_candidates:
-                # Evaluate placement with simulation using adaptive T
-                value, delta, reward = evaluate_placement(
-                    self.garden,
-                    variety,
-                    position,
-                    adaptive_T,
-                    self.config['placement']['beta'],
-                    self.config['simulation']['w_short'],
-                    self.config['simulation']['w_long'],
-                    self.current_score,
-                )
-                
-                first_stage_results.append((value, variety, position))
-                if value > best_value:
-                    best_value = value
-                    best_variety = variety
-                    best_position = position
-        
-        # Stage 2: Finegrained search - re-evaluate top K with deeper simulation
-        finegrained_enabled = self.config.get('performance', {}).get('finegrained_search', False)
-        if finegrained_enabled and len(first_stage_results) > 1:
-            finegrained_top_k = self.config.get('performance', {}).get('finegrained_top_k', 5)
-            finegrained_T = self.config.get('performance', {}).get('finegrained_T', 200)
-            
-            # Sort by value and take top K
-            first_stage_results.sort(reverse=True, key=lambda x: x[0])
-            top_k_for_refinement = first_stage_results[:min(finegrained_top_k, len(first_stage_results))]
-            
-            if self.config['debug']['verbose']:
-                print(f'    Finegrained: re-evaluating top {len(top_k_for_refinement)} with T={finegrained_T}')
-            
-            # Re-evaluate with deeper simulation
-            best_value = float('-inf')
-            best_variety = None
-            best_position = None
-            
-            use_parallel_fg = (
-                self.config.get('performance', {}).get('parallel', False) and
-                len(top_k_for_refinement) >= 4  # Use parallel if >= 4 candidates
-            )
-            
-            if use_parallel_fg:
-                try:
-                    eval_args_fg = [
-                        (
-                            copy.deepcopy(self.garden),
-                            variety,
-                            position,
-                            finegrained_T,
-                            self.config['placement']['beta'],
-                            self.config['simulation']['w_short'],
-                            self.config['simulation']['w_long'],
-                            self.current_score
-                        )
-                        for value, variety, position in top_k_for_refinement
-                    ]
-                    
-                    with Pool(processes=num_workers) as pool:
-                        results_fg = pool.map(_evaluate_placement_worker, eval_args_fg)
-                    
-                    for value, delta, reward, variety, position in results_fg:
-                        if value > best_value:
-                            best_value = value
-                            best_variety = variety
-                            best_position = position
-                
-                except Exception:
-                    use_parallel_fg = False
-            
-            if not use_parallel_fg:
-                for old_value, variety, position in top_k_for_refinement:
-                    value, delta, reward = evaluate_placement(
-                        self.garden,
-                        variety,
-                        position,
-                        finegrained_T,
-                        self.config['placement']['beta'],
-                        self.config['simulation']['w_short'],
-                        self.config['simulation']['w_long'],
-                        self.current_score,
-                    )
-                    
-                    if value > best_value:
-                        best_value = value
-                        best_variety = variety
-                        best_position = position
-        
-        if self.config['debug']['verbose']:
-            skipped_pattern = sum(len(group) - 1 for group in interaction_groups.values() if len(group) > 1)
-            skipped_pruning = len(representatives) - evaluations_run
-            print(f'    Ran {evaluations_run} simulations (T={adaptive_T}), skipped {skipped_pattern} (pattern) + {skipped_pruning} (pruning)')
-        
-        # PHASE 2: If nothing found with strict requirement, try relaxed
-        if best_variety is None and require_two_species:
-            if self.config['debug']['verbose']:
-                print(f'    No 2-species found. Trying 1-species relaxation...')
-            
-            used_relaxation = True  # Mark that we're using relaxation
-            
-            # Re-group with relaxed constraint
-            interaction_groups_relaxed = defaultdict(list)
-            
-            for position in candidates:
-                for variety in varieties_to_evaluate:
-                    if not self.garden.can_place_plant(variety, position):
-                        continue
-                    
-                    interacting_species = self._get_interacting_species(variety, position)
-                    
-                    # Relaxed: just need 1+ species
-                    if len(interacting_species) < 1:
-                        continue
-                    
-                    variety_sig = self._variety_signature(variety)
-                    interaction_key = (variety_sig, frozenset(interacting_species))
-                    
-                    min_distance = float('inf')
-                    for plant in self.garden.plants:
-                        dist = ((position.x - plant.position.x)**2 + (position.y - plant.position.y)**2)**0.5
-                        min_distance = min(min_distance, dist)
-                    
-                    space_score = -min_distance
-                    interaction_groups_relaxed[interaction_key].append((position, variety, space_score))
-            
-            # Apply early pruning for relaxed candidates too
-            representatives_relaxed = []
-            for interaction_key, group in interaction_groups_relaxed.items():
-                group.sort(key=lambda x: x[2], reverse=True)
-                position, variety, space_score = group[0]
-                cheap_score = self._cheap_heuristic_score(variety, position)
-                representatives_relaxed.append((cheap_score, position, variety))
-            
-            # Sort and take top 30%
-            representatives_relaxed.sort(reverse=True, key=lambda x: x[0])
-            num_to_evaluate_relaxed = max(10, int(len(representatives_relaxed) * 0.3))
-            top_relaxed = representatives_relaxed[:num_to_evaluate_relaxed]
-            
-            # Use parallel evaluation for relaxed candidates too
-            use_parallel_relaxed = (
-                self.config.get('performance', {}).get('parallel', False) and
-                len(top_relaxed) >= self.config.get('performance', {}).get('parallel_threshold', 8)
-            )
-            
-            if use_parallel_relaxed:
-                try:
-                    eval_args_relaxed = [
-                        (
-                            copy.deepcopy(self.garden),
-                            variety,
-                            position,
-                            adaptive_T,
-                            self.config['placement']['beta'],
-                            self.config['simulation']['w_short'],
-                            self.config['simulation']['w_long'],
-                            self.current_score
-                        )
-                        for cheap_score, position, variety in top_relaxed
-                    ]
-                    
-                    num_workers = self.config.get('performance', {}).get('num_workers', 4)
-                    with Pool(processes=num_workers) as pool:
-                        results_relaxed = pool.map(_evaluate_placement_worker, eval_args_relaxed)
-                    
-                    for value, delta, reward, variety, position in results_relaxed:
-                        if value > best_value:
-                            best_value = value
-                            best_variety = variety
-                            best_position = position
-                
-                except Exception:
-                    use_parallel_relaxed = False
-            
-            if not use_parallel_relaxed:
-                for cheap_score, position, variety in top_relaxed:
-                    value, delta, reward = evaluate_placement(
-                        self.garden,
-                        variety,
-                        position,
-                        adaptive_T,
-                        self.config['placement']['beta'],
-                        self.config['simulation']['w_short'],
-                        self.config['simulation']['w_long'],
-                        self.current_score,
-                    )
-                    
-                    if value > best_value:
-                        best_value = value
-                        best_variety = variety
-                        best_position = position
-        
-        # Map representative back to actual variety instance
-        if best_variety is not None:
-            best_sig = self._variety_signature(best_variety)
-            for var in self.remaining_varieties:
-                if self._variety_signature(var) == best_sig:
-                    best_variety = var
-                    break
-        
-        return best_value, best_variety, best_position, used_relaxation
-    
-    def _get_interacting_species(self, variety: PlantVariety, position: Position) -> set:
-        """
-        Get the set of species this variety would interact with at this position.
-        Uses caching to avoid redundant calculations.
-        """
-        # Cache key: (variety_sig, position, garden_size)
-        # Garden size changes when we place plants, so cache auto-invalidates
-        cache_key = (
-            self._variety_signature(variety),
-            (int(position.x * 10), int(position.y * 10)),  # Round to 0.1 precision
-            len(self.garden.plants)
-        )
-        
-        if cache_key in self.interaction_cache:
-            return self.interaction_cache[cache_key]
-        
-        # Calculate interactions
-        interacting_species = set()
-        for plant in self.garden.plants:
-            if plant.variety.species == variety.species:
-                continue
-            
-            distance = calculate_distance(position, plant.position)
-            interaction_distance = plant.variety.radius + variety.radius
-            
-            if distance < interaction_distance:
-                interacting_species.add(plant.variety.species)
-        
-        # Store in cache
-        self.interaction_cache[cache_key] = interacting_species
-        return interacting_species
-    
     def _filter_boundary_candidates(self, candidates: list[Position], variety: PlantVariety) -> list[Position]:
         """
         Filter candidates to keep only those on the OUTER BOUNDARY of existing plant groups.
@@ -1014,86 +482,21 @@ class GreedyGardener(Gardener):
 
         return totals
 
-    def _would_interact_with_two_species(self, variety: PlantVariety, position: Position) -> bool:
-        """
-        Check if placing a variety at position would interact with at least 2 different species.
-
-        Args:
-            variety: Variety to place
-            position: Position to check
-
-        Returns:
-            True if would interact with 2+ different species, False otherwise
-        """
+    def _count_interacting_species(self, variety: PlantVariety, position: Position) -> int:
+        """Return how many different species would interact with ``variety`` at ``position``."""
         interacting_species = set()
 
         for plant in self.garden.plants:
-            # Skip same species (can't exchange with same species)
             if plant.variety.species == variety.species:
                 continue
 
-            # Check if within interaction distance
             distance = calculate_distance(position, plant.position)
             interaction_distance = plant.variety.radius + variety.radius
 
             if distance < interaction_distance:
                 interacting_species.add(plant.variety.species)
 
-        return len(interacting_species) >= 2
-    
-    def _would_interact_with_any_species(self, variety: PlantVariety, position: Position) -> bool:
-        """
-        Check if placing a variety at position would interact with at least 1 different species.
-
-        Args:
-            variety: Variety to place
-            position: Position to check
-
-        Returns:
-            True if would interact with 1+ different species, False otherwise
-        """
-        for plant in self.garden.plants:
-            # Skip same species
-            if plant.variety.species == variety.species:
-                continue
-
-            # Check if within interaction distance
-            distance = calculate_distance(position, plant.position)
-            interaction_distance = plant.variety.radius + variety.radius
-
-            if distance < interaction_distance:
-                return True
-
-        return False
-    
-    def _plant_interacts_with_two_species(self, plant) -> bool:
-        """
-        Check if a placed plant currently interacts with at least 2 different species.
-
-        Args:
-            plant: Plant to check
-
-        Returns:
-            True if interacts with 2+ different species, False otherwise
-        """
-        interacting_species = set()
-
-        for other_plant in self.garden.plants:
-            if other_plant == plant:
-                continue
-            
-            # Skip same species
-            if other_plant.variety.species == plant.variety.species:
-                continue
-
-            # Check if within interaction distance
-            distance = calculate_distance(plant.position, other_plant.position)
-            interaction_distance = plant.variety.radius + other_plant.variety.radius
-
-            if distance < interaction_distance:
-                interacting_species.add(other_plant.variety.species)
-
-        return len(interacting_species) >= 2
+        return len(interacting_species)
 
     def _prioritize_varieties(self) -> list[PlantVariety]:
         """
@@ -1177,6 +580,169 @@ class GreedyGardener(Gardener):
 
         return sorted_varieties
 
+    def _find_best_placement(self, candidates: list[Position]) -> tuple:
+        """
+        Find the best (variety, position) pair among all candidates and varieties.
+
+        Returns:
+            Tuple of (best_value, best_variety, best_position)
+        """
+        best_value = float('-inf')
+        best_variety = None
+        best_position = None
+
+        # Get prioritized varieties
+        prioritized_varieties = self._prioritize_varieties()
+
+        # For first 3 plants: only evaluate species representatives (fast)
+        # For 4+ plants: evaluate unique varieties (by signature, avoid duplicates)
+        if len(self.garden.plants) < 3:
+            # Group varieties by species - only evaluate one representative per species
+            species_representatives = {}
+            for variety in prioritized_varieties:
+                if variety.species not in species_representatives:
+                    species_representatives[variety.species] = variety
+            varieties_to_evaluate = list(species_representatives.values())
+            eval_label = "species"
+        else:
+            # Group by variety signature to avoid evaluating identical plants
+            # (e.g., 10 identical Rhododendrons → evaluate once)
+            signature_representatives = {}
+            signature_to_varieties = {}  # Track all varieties for each signature
+            for variety in prioritized_varieties:
+                sig = self._variety_signature(variety)
+                if sig not in signature_representatives:
+                    signature_representatives[sig] = variety
+                    signature_to_varieties[sig] = []
+                signature_to_varieties[sig].append(variety)
+            varieties_to_evaluate = list(signature_representatives.values())
+            eval_label = "unique_vars"
+
+        # For all plants: use all candidates (no zone filtering for now)
+        # Zone filtering was too aggressive and filtered out valid placements
+        variety_to_positions = {}
+        for v in varieties_to_evaluate:
+            variety_to_positions[id(v)] = candidates
+
+        # Calculate actual evaluation count
+        actual_evaluations = sum(len(positions) for positions in variety_to_positions.values())
+
+        if self.config['debug']['verbose']:
+            print(
+                f'  Eval: {len(candidates)} pos × {len(varieties_to_evaluate)} {eval_label} = {actual_evaluations} combos',
+                end='',
+            )
+
+        baseline_growth = None
+        if len(self.garden.plants) >= 3:
+            baseline_growth = simulate_total_growth(self.garden, self.config['simulation']['T'])
+
+        # Evaluate each variety at its filtered positions
+        penalized_count = 0
+        can_place_rejected = 0
+        species_rejected = 0
+        interaction_rejected = 0
+
+        for idx, variety in enumerate(varieties_to_evaluate):
+            positions_for_variety = variety_to_positions.get(id(variety), [])
+            
+            for position in positions_for_variety:
+                # Check if can place
+                if not self.garden.can_place_plant(variety, position):
+                    can_place_rejected += 1
+                    continue
+
+                # HARD REQUIREMENT: First 3 plants MUST be different species
+                if len(self.garden.plants) < 3:
+                    existing_species = {p.variety.species for p in self.garden.plants}
+                    if variety.species in existing_species:
+                        penalized_count += 1
+                        species_rejected += 1
+                        continue
+
+                interaction_species_count = 0
+                if len(self.garden.plants) >= 3:
+                    interaction_species_count = self._count_interacting_species(variety, position)
+                    if interaction_species_count == 0:
+                        penalized_count += 1
+                        interaction_rejected += 1
+                        continue
+
+                # For first 3 plants: FORCE placement without score evaluation
+                # Just pick the first valid position (already prioritized by species order)
+                if len(self.garden.plants) < 3:
+                    best_value = 999.0  # Dummy high value
+                    best_variety = variety
+                    best_position = position
+                    break  # Take first valid position
+                
+                # For 4+ plants: evaluate with simulation score
+                value, delta, reward = evaluate_placement(
+                    self.garden,
+                    variety,
+                    position,
+                    self.config['simulation']['T'],
+                    self.config['placement']['beta'],
+                    self.config['simulation']['w_short'],
+                    self.config['simulation']['w_long'],
+                    self.current_score,
+                    baseline_growth,
+                )
+
+                # Add priority bonus to encourage nutrient balance
+                priority_bonus = self.config['placement'].get('nutrient_bonus', 2.0)
+                priority_rank = len(prioritized_varieties) - idx
+                priority_weight = priority_rank / len(prioritized_varieties)
+
+                bonus = 0.0
+
+                # Regular nutrient balance bonus for 4th plant onwards
+                totals = self._get_nutrient_balance()
+                max_total = max(totals.values())
+                min_total = min(totals.values())
+                imbalance = max_total - min_total
+
+                bonus += priority_bonus * priority_weight * (imbalance / (max_total + 1.0))
+
+                penalty = 0.0
+                if len(self.garden.plants) >= 3 and interaction_species_count < 2:
+                    diversity_penalty = self.config['placement'].get('diversity_penalty', 0.0)
+                    penalty = diversity_penalty * (2 - interaction_species_count)
+
+                value_with_bonus = value + bonus - penalty
+
+                if value_with_bonus > best_value:
+                    best_value = value_with_bonus
+                    best_variety = variety
+                    best_position = position
+            
+            # For first 3 plants, break after finding first valid position
+            if len(self.garden.plants) < 3 and best_variety is not None:
+                break
+        
+
+        # Map representative back to actual variety instance from remaining_varieties
+        if best_variety is not None and best_variety not in self.remaining_varieties:
+            if len(self.garden.plants) < 3:
+                # For first 3 plants: map by species as a fallback when representative was filtered out
+                for var in self.remaining_varieties:
+                    if var.species == best_variety.species:
+                        best_variety = var
+                        break
+            else:
+                # For 4+ plants: map by signature (to get an actual instance with same params)
+                best_sig = self._variety_signature(best_variety)
+                for var in self.remaining_varieties:
+                    if self._variety_signature(var) == best_sig:
+                        best_variety = var
+                        break
+
+        # Print compact summary
+        if self.config['debug']['verbose']:
+            rejection_note = f', rejected {penalized_count}' if penalized_count > 0 else ''
+            print(f'{rejection_note}')
+
+        return best_value, best_variety, best_position
 
     def _build_variety_inventory(self, varieties: list[PlantVariety]) -> dict:
         inventory = defaultdict(list)
@@ -1361,10 +927,9 @@ class GreedyGardener(Gardener):
                 break
 
         if placed_any:
-            adaptive_T = self._get_adaptive_T()
             self.current_score = simulate_and_score(
                 self.garden,
-                adaptive_T,
+                self.config['simulation']['T'],
                 self.config['simulation']['w_short'],
                 self.config['simulation']['w_long'],
             )
@@ -1407,20 +972,19 @@ class GreedyGardener(Gardener):
                 print(f'{len(self.remaining_varieties)} varieties remaining')
             
             iteration = 0
-            relaxation_used = False
-            relaxation_plant_idx = None
-            
             while self.remaining_varieties:
                 iteration += 1
                 
-                # ALWAYS use exhaustive search for better coverage
-                exhaustive_candidates = self._generate_exhaustive_candidates()
-                if not exhaustive_candidates:
+                # Generate candidate positions
+                candidates = self._generate_candidates()
+                
+                if not candidates:
                     if self.config['debug']['verbose']:
                         print('No valid candidates found. Stopping.')
                     break
                 
-                best_value, best_variety, best_position, current_used_relaxation = self._find_best_placement_exhaustive_optimized(exhaustive_candidates)
+                # Find best (variety, position) pair (now considers entire garden)
+                best_value, best_variety, best_position = self._find_best_placement(candidates)
                 
                 # Check if no valid placement found
                 if best_variety is None or best_position is None:
@@ -1435,26 +999,6 @@ class GreedyGardener(Gardener):
                         print(f'Best value {best_value:.4f} <= epsilon {epsilon}. Stopping.')
                     break
                 
-                # BEFORE placing: Check if previous plant used relaxation AND current also uses relaxation
-                if relaxation_used and current_used_relaxation:
-                    # Both previous and current use relaxation - not allowed!
-                    # Rollback: remove previous relaxation plant and stop
-                    if self.config['debug']['verbose']:
-                        print(f'  [Relaxation failed: consecutive relaxation detected. Rolling back...]')
-                    
-                    # Remove previous relaxation plant
-                    if relaxation_plant_idx is not None and relaxation_plant_idx < len(self.garden.plants):
-                        relaxed_plant = self.garden.plants[relaxation_plant_idx]
-                        self.garden.plants.remove(relaxed_plant)
-                        self.garden._used_varieties.discard(id(relaxed_plant.variety))
-                        self.remaining_varieties.append(relaxed_plant.variety)
-                        sig = self._variety_signature(relaxed_plant.variety)
-                        if sig in self.available_varieties_by_sig:
-                            self.available_varieties_by_sig[sig].append(relaxed_plant.variety)
-                    
-                    # Stop greedy placement
-                    break
-                
                 # Place the plant
                 plant = self.garden.add_plant(best_variety, best_position)
                 
@@ -1464,56 +1008,16 @@ class GreedyGardener(Gardener):
                 
                 self._consume_variety(best_variety)
                 
-                # AFTER placing: Check if previous relaxation was successful
-                if relaxation_used and not current_used_relaxation:
-                    # Previous plant used relaxation, current plant doesn't
-                    # Check if current plant has 2-species interaction
-                    if self._plant_interacts_with_two_species(plant):
-                        # Good! Current plant has 2-species interaction
-                        # Check if previous relaxed plant now also has 2-species
-                        if relaxation_plant_idx is not None and relaxation_plant_idx < len(self.garden.plants):
-                            relaxed_plant = self.garden.plants[relaxation_plant_idx]
-                            if self._plant_interacts_with_two_species(relaxed_plant):
-                                # Perfect! Relaxation succeeded, reset flag
-                                relaxation_used = False
-                                relaxation_plant_idx = None
-                                if self.config['debug']['verbose']:
-                                    print(f'  [Relaxation successful: restored 2-species interaction]')
-                
-                # Set relaxation flag for current plant
-                if current_used_relaxation:
-                    # This plant used relaxation during search
-                    relaxation_used = True
-                    relaxation_plant_idx = len(self.garden.plants) - 1
-                    if self.config['debug']['verbose']:
-                        print(f'  [Relaxation used: 1-species interaction at plant #{len(self.garden.plants)}]')
-                
-                # Update score with adaptive T
-                adaptive_T = self._get_adaptive_T()
+                # Update score
                 self.current_score = simulate_and_score(
                     self.garden,
-                    adaptive_T,
+                    self.config['simulation']['T'],
                     self.config['simulation']['w_short'],
                     self.config['simulation']['w_long'],
                 )
                 
                 if self.config['debug']['verbose']:
                     print(f'  → {best_variety.species.name[0]} at ({int(best_position.x)},{int(best_position.y)}): value={best_value:.2f}, score={self.current_score:.2f}')
-            
-            # After loop ends, check if last plant used relaxation
-            # If so, remove it (can't have relaxation as final plant)
-            if relaxation_used and relaxation_plant_idx is not None:
-                if self.config['debug']['verbose']:
-                    print(f'  [Removing final relaxation plant: cannot end with 1-species interaction]')
-                
-                if relaxation_plant_idx < len(self.garden.plants):
-                    relaxed_plant = self.garden.plants[relaxation_plant_idx]
-                    self.garden.plants.remove(relaxed_plant)
-                    self.garden._used_varieties.discard(id(relaxed_plant.variety))
-                    self.remaining_varieties.append(relaxed_plant.variety)
-                    sig = self._variety_signature(relaxed_plant.variety)
-                    if sig in self.available_varieties_by_sig:
-                        self.available_varieties_by_sig[sig].append(relaxed_plant.variety)
         
         if self.config['debug']['verbose'] and self.remaining_varieties:
             print(f'\n{len(self.remaining_varieties)} varieties left')
@@ -1534,37 +1038,33 @@ class GreedyGardener(Gardener):
             new_group_start_idx = len(self.garden.plants)
             new_group_plants = []
             first_plant_position = None
-            relaxation_used = False  # Track if we've used the 1-species relaxation
-            relaxation_plant_idx = None  # Index of plant that used relaxation
-            relaxation_used_at_size = None  # Track group size when relaxation was used
             
             # Try to place at least 3 plants for this new group
             for plant_num in range(1, 100):  # Max 100 attempts per position
                 new_group_size = len(self.garden.plants) - new_group_start_idx
                 
-                if self.config['debug']['verbose']:
-                    print(f'  Iter {plant_num}: {new_group_size} in group, {len(self.remaining_varieties)} remain')
+                if new_group_size >= 3:
+                    # Successfully built a group of 3+
+                    if self.config['debug']['verbose']:
+                        print(f'  Successfully built new group with {new_group_size} plants!')
+                    return True
                 
                 # Generate candidates for this plant of the new group
                 if new_group_size == 0:
                     # First plant: find next available position (skip attempted ones)
                     candidates = self._find_next_positions_for_new_group()
                 else:
-                    # 2nd+ plant: ALWAYS use exhaustive search for comprehensive coverage
-                    candidates = self._generate_exhaustive_candidates()
+                    # 2nd+ plant: use standard candidate generation
+                    # This allows new group to interact with entire garden
+                    candidates = self._generate_candidates()
                 
                 if not candidates:
                     break
                 
                 # Find best placement for new group
-                if new_group_size < 3:
-                    # For first 3 plants: use special logic with forced placement
-                    best_value, best_variety, best_position, used_relaxation = self._find_best_placement_for_new_group(
-                        candidates, new_group_start_idx, relaxation_used
-                    )
-                else:
-                    # For 4+ plants: use standard exhaustive optimized search
-                    best_value, best_variety, best_position, used_relaxation = self._find_best_placement_exhaustive_optimized(candidates)
+                best_value, best_variety, best_position = self._find_best_placement_for_new_group(
+                    candidates, new_group_start_idx
+                )
                 
                 if best_variety is None or best_position is None:
                     if self.config['debug']['verbose'] and new_group_size < 3:
@@ -1581,37 +1081,6 @@ class GreedyGardener(Gardener):
                 new_group_plants.append(plant)
                 self._consume_variety(best_variety)
                 
-                # Record if this plant used relaxation
-                # For first 3 plants: check the returned flag
-                # For 4+ plants: check if plant actually has 2-species interaction
-                if new_group_size < 3:
-                    if used_relaxation and not relaxation_used:
-                        # First time using relaxation in this group
-                        relaxation_used = True
-                        relaxation_plant_idx = len(self.garden.plants) - 1
-                        relaxation_used_at_size = new_group_size + 1  # Size after placing this plant
-                        if self.config['debug']['verbose']:
-                            print(f'  [Relaxation used: 1-species interaction allowed at plant #{relaxation_used_at_size}]')
-                else:
-                    # For 4+ plants: check if plant has 2-species interaction
-                    if not relaxation_used and not self._plant_interacts_with_two_species(plant):
-                        relaxation_used = True
-                        relaxation_plant_idx = len(self.garden.plants) - 1
-                        relaxation_used_at_size = new_group_size + 1
-                        if self.config['debug']['verbose']:
-                            print(f'  [Relaxation used: 1-species interaction allowed at plant #{relaxation_used_at_size}]')
-                
-                # Check if previously relaxed plant now connects to 2+ species
-                # If so, reset relaxation
-                if relaxation_plant_idx is not None and relaxation_plant_idx < len(self.garden.plants):
-                    relaxed_plant = self.garden.plants[relaxation_plant_idx]
-                    if self._plant_interacts_with_two_species(relaxed_plant):
-                        relaxation_used = False
-                        relaxation_plant_idx = None
-                        relaxation_used_at_size = None
-                        if self.config['debug']['verbose']:
-                            print(f'  [Relaxation refreshed: previous 1-species plant now connects to 2+ species]')
-                
                 # Record first plant position
                 if new_group_size == 0:
                     first_plant_position = best_position
@@ -1622,46 +1091,8 @@ class GreedyGardener(Gardener):
             
             # Check if we built a valid group
             final_size = len(self.garden.plants) - new_group_start_idx
-            
-            # Determine if this group is acceptable
-            is_acceptable = False
             if final_size >= 3:
-                # If relaxation was used, check if next plant has 2-species interaction
-                if relaxation_used_at_size is not None:
-                    plants_after_relaxation = final_size - relaxation_used_at_size
-                    if plants_after_relaxation >= 1:
-                        # Check if the plant AFTER relaxation has 2-species interaction
-                        plant_after_idx = new_group_start_idx + relaxation_used_at_size
-                        if plant_after_idx < len(self.garden.plants):
-                            plant_after = self.garden.plants[plant_after_idx]
-                            if self._plant_interacts_with_two_species(plant_after):
-                                # Good: relaxation was used and next plant has 2-species
-                                is_acceptable = True
-                                if self.config['debug']['verbose']:
-                                    print(f'  Group accepted: {final_size} plants, relaxation at #{relaxation_used_at_size} restored by next plant')
-                            else:
-                                # Bad: relaxation was used but next plant also doesn't have 2-species
-                                if self.config['debug']['verbose']:
-                                    print(f'  Group rejected: {final_size} plants, relaxation not restored (next plant lacks 2-species)')
-                                is_acceptable = False
-                        else:
-                            # No plant after relaxation
-                            if self.config['debug']['verbose']:
-                                print(f'  Group rejected: {final_size} plants but stopped immediately after relaxation')
-                            is_acceptable = False
-                    else:
-                        # Bad: relaxation was used and no more plants could be added
-                        if self.config['debug']['verbose']:
-                            print(f'  Group rejected: {final_size} plants but stopped immediately after relaxation')
-                        is_acceptable = False
-                else:
-                    # No relaxation used, group is good if >= 3 plants
-                    is_acceptable = True
-            
-            if is_acceptable:
                 # Success!
-                if self.config['debug']['verbose']:
-                    print(f'  Successfully built new group with {final_size} plants!')
                 return True
             else:
                 # Failed with this starting position
@@ -1790,21 +1221,15 @@ class GreedyGardener(Gardener):
         
         return filter_candidates(candidates, self.garden, tolerance=0.1)
     
-    def _find_best_placement_for_new_group(self, candidates: list[Position], new_group_start_idx: int, relaxation_used: bool = False) -> tuple:
+    def _find_best_placement_for_new_group(self, candidates: list[Position], new_group_start_idx: int) -> tuple:
         """
         Find best placement for new group plants.
         New group plants can interact with entire garden (including old groups).
         Only requirement: first 3 plants of new group must be different species.
-        
-        For 4th+ plant: if no 2-species interaction found and relaxation not used,
-        allow 1-species interaction as fallback.
-        
-        Returns: (best_value, best_variety, best_position, used_relaxation)
         """
         best_value = float('-inf')
         best_variety = None
         best_position = None
-        used_relaxation = False
         
         new_group_size = len(self.garden.plants) - new_group_start_idx
         prioritized_varieties = self._prioritize_varieties()
@@ -1829,11 +1254,15 @@ class GreedyGardener(Gardener):
                     signature_representatives[sig] = variety
             varieties_to_evaluate = list(signature_representatives.values())
         
+        baseline_growth = None
+        if len(self.garden.plants) >= 3:
+            baseline_growth = simulate_total_growth(self.garden, self.config['simulation']['T'])
+
         for position in candidates:
             for variety in varieties_to_evaluate:
                 if not self.garden.can_place_plant(variety, position):
                     continue
-                
+
                 # Check species constraint for first 3 plants of new group
                 if new_group_size < 3:
                     existing_species_in_new_group = {
@@ -1843,113 +1272,47 @@ class GreedyGardener(Gardener):
                     if variety.species in existing_species_in_new_group:
                         continue
                     
-                    # For 1st plant: can place anywhere (no other plants to interact with)
-                    # For 2nd plant: must interact with 1st plant
-                    # For 3rd plant: must interact with 2 different species (both plants in new group)
-                    if new_group_size == 0:
-                        # 1st plant: no interaction check needed
-                        best_value = 999.0
-                        best_variety = variety
-                        best_position = position
-                        break
-                    elif new_group_size == 1:
-                        # 2nd plant: check if interacts with 1st plant (1 species minimum)
-                        new_group_plants = self.garden.plants[new_group_start_idx:]
-                        interacting_species = set()
-                        for plant in new_group_plants:
-                            if plant.variety.species == variety.species:
-                                continue
-                            dist = ((position.x - plant.position.x)**2 + (position.y - plant.position.y)**2)**0.5
-                            if dist < plant.variety.radius + variety.radius:
-                                interacting_species.add(plant.variety.species)
-                        
-                        if len(interacting_species) >= 1:
-                            best_value = 999.0
-                            best_variety = variety
-                            best_position = position
-                            break
-                        else:
-                            # Failed: doesn't interact with 1st plant, skip this position
-                            continue
-                    elif new_group_size == 2:
-                        # 3rd plant: check if interacts with 2 different species in new group
-                        new_group_plants = self.garden.plants[new_group_start_idx:]
-                        interacting_species = set()
-                        for plant in new_group_plants:
-                            if plant.variety.species == variety.species:
-                                continue
-                            dist = ((position.x - plant.position.x)**2 + (position.y - plant.position.y)**2)**0.5
-                            if dist < plant.variety.radius + variety.radius:
-                                interacting_species.add(plant.variety.species)
-                        
-                        if len(interacting_species) >= 2:
-                            best_value = 999.0
-                            best_variety = variety
-                            best_position = position
-                            break
-                        else:
-                            # Failed: doesn't interact with 2 species, skip this position
-                            continue
+                    # For first 3 plants: FORCE placement without score evaluation
+                    # Just pick the first valid position
+                    best_value = 999.0  # Dummy high value
+                    best_variety = variety
+                    best_position = position
+                    break  # Take first valid position
                 
+                interaction_species_count = 0
+                if len(self.garden.plants) >= 3:
+                    interaction_species_count = self._count_interacting_species(variety, position)
+                    if interaction_species_count == 0:
+                        continue
+
                 # For 4+ plants: use score function to evaluate placement quality
-                adaptive_T = self._get_adaptive_T()
                 value, delta, reward = evaluate_placement(
                     self.garden,
                     variety,
                     position,
-                    adaptive_T,
+                    self.config['simulation']['T'],
                     self.config['placement']['beta'],
                     self.config['simulation']['w_short'],
                     self.config['simulation']['w_long'],
                     self.current_score,
+                    baseline_growth,
                 )
-                
-                if value > best_value:
-                    best_value = value
+
+                penalty = 0.0
+                if len(self.garden.plants) >= 3 and interaction_species_count < 2:
+                    diversity_penalty = self.config['placement'].get('diversity_penalty', 0.0)
+                    penalty = diversity_penalty * (2 - interaction_species_count)
+
+                adjusted_value = value - penalty
+
+                if adjusted_value > best_value:
+                    best_value = adjusted_value
                     best_variety = variety
                     best_position = position
-            
+
             # For first 3 plants, break after finding first valid position
             if new_group_size < 3 and best_variety is not None:
                 break
-        
-        # FALLBACK: If no placement found and we can use relaxation (for 4th+ plant)
-        # Try allowing 1-species interaction instead of requiring 2-species
-        if best_variety is None and new_group_size >= 3 and not relaxation_used:
-            if self.config['debug']['verbose']:
-                print(f'    No 2-species placement found. Trying 1-species relaxation...')
-            
-            # Re-evaluate all candidates with relaxed constraint (1+ species interaction)
-            for position in candidates:
-                for variety in varieties_to_evaluate:
-                    if not self.garden.can_place_plant(variety, position):
-                        continue
-                    
-                    # Species constraint should not apply here (only for 4+ plants)
-                    # (First 3 plants already enforced different species above)
-                    
-                    # Relaxed constraint: just need to interact with 1+ species (not necessarily 2)
-                    if not self._would_interact_with_any_species(variety, position):
-                        continue
-                    
-                    # Evaluate placement with adaptive T
-                    adaptive_T = self._get_adaptive_T()
-                    value, delta, reward = evaluate_placement(
-                        self.garden,
-                        variety,
-                        position,
-                        adaptive_T,
-                        self.config['placement']['beta'],
-                        self.config['simulation']['w_short'],
-                        self.config['simulation']['w_long'],
-                        self.current_score,
-                    )
-                    
-                    if value > best_value:
-                        best_value = value
-                        best_variety = variety
-                        best_position = position
-                        used_relaxation = True  # Mark that we used relaxation
         
         # Map representative back to actual variety instance
         if best_variety is not None and new_group_size >= 3:
@@ -1960,4 +1323,4 @@ class GreedyGardener(Gardener):
                     best_variety = var
                     break
         
-        return best_value, best_variety, best_position, used_relaxation
+        return best_value, best_variety, best_position

@@ -63,6 +63,14 @@ def simulate_and_score(
     return total_growth / len(test_garden.plants)
 
 
+def simulate_total_growth(garden: Garden, turns: int) -> float:
+    """Run a simulation and return the total growth after ``turns``."""
+    garden_copy = copy_garden(garden)
+    engine = Engine(garden_copy)
+    engine.run_simulation(turns)
+    return sum(plant.size for plant in garden_copy.plants)
+
+
 def copy_garden(garden: Garden) -> Garden:
     """
     Create a deep copy of the garden with all plants.
@@ -349,6 +357,7 @@ def evaluate_placement(
     w_short: float,
     w_long: float,
     current_score: float,
+    baseline_growth: float | None = None,
 ) -> tuple[float, float, float]:
     """
     Evaluate placing a variety at a position.
@@ -397,12 +406,11 @@ def evaluate_placement(
     # For plants 4+: use simple growth-based scoring
     # Score = (overall_growth_new - overall_growth_old) / radius^2
     
-    # Simulate old garden (using a copy to avoid modifying original)
-    old_garden_copy = copy_garden(garden)
-    old_engine = Engine(old_garden_copy)
-    old_engine.run_simulation(turns)
-    old_growth = sum(plant.size for plant in old_garden_copy.plants)
-    
+    if baseline_growth is None:
+        old_growth = simulate_total_growth(garden, turns)
+    else:
+        old_growth = baseline_growth
+
     # Simulate new garden
     new_engine = Engine(test_garden)
     new_engine.run_simulation(turns)
