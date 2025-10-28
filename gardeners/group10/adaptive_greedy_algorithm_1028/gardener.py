@@ -17,7 +17,7 @@ from core.gardener import Gardener  # noqa: E402
 from core.micronutrients import Micronutrient  # noqa: E402
 from core.plants.plant_variety import PlantVariety  # noqa: E402
 from core.point import Position  # noqa: E402
-from gardeners.group10.greedy_planting_algorithm_1026.utils import (  # noqa: E402
+from gardeners.group10.adaptive_greedy_algorithm_1028.utils import (  # noqa: E402
     calculate_area_outside_boundary,
     calculate_distance,
     calculate_intersection_area,
