@@ -440,7 +440,7 @@ class GreedyGardener(Gardener):
 
             # Select representative from each species: smallest radius, highest production
             representatives = []
-            for _species, varieties in species_groups.items():
+            for species, varieties in species_groups.items():
 
                 def rep_key(v):
                     overall_prod = sum(c for c in v.nutrient_coefficients.values() if c > 0)
