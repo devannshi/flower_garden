@@ -6,19 +6,14 @@ simulation:
                              # Set to match expected simulation length (typically 100 for competition)
   w_short: 0.2              # Weight for short-term growth (turns 1-5)
   w_long: 1.0               # Weight for long-term growth (turns 6-T)
+  adaptive_T_min: 40        # Minimum T for adaptive simulation (late-stage plants)
+  adaptive_T_alpha: 0.7     # Decay shape parameter (0.7 = slower decay early, faster later)
+  area_power: 1.5           # Power for area calculation: circle_area = π × r^area_power (default 2.0 = quadratic)
 
-placement:
-  epsilon: -10             # Improvement threshold for stopping (allow small decreases)
-  beta: 1.5                 # Weight for plant reward in selection
-  nutrient_bonus: 3.0       # Bonus for varieties that balance nutrients
-  diversity_penalty: 2.0    # Penalty for not interacting with 2+ species (from 3rd plant)
-  
-geometry:
-  grid_samples: 8           # Grid points per dimension for first plant (reduced for speed)
-  angle_samples: 8          # Tangency angles per existing plant (reduced from 12 for speed)
-  max_candidates: 50        # Max candidates to evaluate per iteration (reduced for speed)
-  tolerance: 0.5            # Spatial deduplication tolerance
-  max_anchor_pairs: 10      # Max pairs of anchors for CCI generation (reduced from 15 for speed)
+
+candidate_filtering:
+  max_candidates: 50        # Max candidates to evaluate per iteration
+  tolerance: 0.5            # Spatial deduplication tolerance for filter_candidates
 
 heuristic:
   lambda_interact: 3.0      # Weight for interaction density in pre-ranking
@@ -38,3 +33,6 @@ performance:
   finegrained_top_k: 4      # Top K candidates to re-evaluate with deeper simulation
   finegrained_T: 500        # Deeper simulation turns for top K (typically 2x of adaptive T)
 
+placement:
+  epsilon: -10             # Improvement threshold for stopping (allow small decreases)
+  

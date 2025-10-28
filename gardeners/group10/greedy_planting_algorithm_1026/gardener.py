@@ -426,33 +426,34 @@ class GreedyGardener(Gardener):
         # For first 3 plants: select representative from each species, then sort by species descending
         if len(self.garden.plants) < 3:
             from collections import defaultdict
-            
+
             # Determine which species are available
             existing_species = {p.variety.species for p in self.garden.plants}
             available_varieties = [
                 v for v in self.remaining_varieties if v.species not in existing_species
             ]
-            
+
             # Group by species
             species_groups = defaultdict(list)
             for v in available_varieties:
                 species_groups[v.species].append(v)
-            
+
             # Select representative from each species: smallest radius, highest production
             representatives = []
-            for species, varieties in species_groups.items():
+            for _species, varieties in species_groups.items():
+
                 def rep_key(v):
                     overall_prod = sum(c for c in v.nutrient_coefficients.values() if c > 0)
                     return (v.radius, -overall_prod)
-                
+
                 rep = min(varieties, key=rep_key)
                 representatives.append(rep)
-            
+
             # Sort representatives by radius descending (largest radius first), then by production
             def sort_key(v):
                 overall_prod = sum(c for c in v.nutrient_coefficients.values() if c > 0)
                 return (-v.radius, -overall_prod, -v.species.value)
-            
+
             sorted_varieties = sorted(representatives, key=sort_key)
             return sorted_varieties
 
@@ -566,12 +567,12 @@ class GreedyGardener(Gardener):
                     priority_bonus = self.config['placement'].get('nutrient_bonus', 2.0)
                     priority_rank = len(prioritized_varieties) - idx
                     priority_weight = priority_rank / len(prioritized_varieties)
-                    
+
                     totals = self._get_nutrient_balance()
                     max_total = max(totals.values())
                     min_total = min(totals.values())
                     imbalance = max_total - min_total
-                    
+
                     bonus = priority_bonus * priority_weight * (imbalance / (max_total + 1.0))
 
                 value_with_bonus = value + bonus

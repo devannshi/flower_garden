@@ -1,1 +1,0 @@
-"""Greedy Planting Algorithm Implementation."""
